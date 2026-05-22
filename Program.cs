@@ -2,6 +2,7 @@
 using MathNet.Numerics.IntegralTransforms;
 using NAudio.Lame;
 using NAudio.Wave;
+using System.Threading.Tasks;
 
 string inputPath = @"C:\Users\Robyn\Downloads\kevin-macleod-hall-of-the-mountain-king.mp3";
 string outputPath = Path.ChangeExtension(inputPath, "_shitty.mp3");
@@ -18,6 +19,9 @@ int channels = reader.WaveFormat.Channels;
 var samples = new float[reader.Length / sizeof(float)];
 reader.Read(samples, 0, samples.Length);
 
+var originalLength = samples.Length / channels;
+var lengthWhileProcessing = (int)Math.Ceiling((double)originalLength / fftSize) * fftSize; // Round up to multiple of fftSize
+
 // Process each channel independently
 float[][] Deinterleave(float[] samples, int channels)
 {
@@ -26,7 +30,7 @@ float[][] Deinterleave(float[] samples, int channels)
 
     for (int ch = 0; ch < channels; ch++)
     {
-        result[ch] = new float[length];
+        result[ch] = new float[lengthWhileProcessing];
         for (int i = 0; i < length; i++)
             result[ch][i] = samples[i * channels + ch];
     }
@@ -35,36 +39,52 @@ float[][] Deinterleave(float[] samples, int channels)
 }
 float[][] channelData = Deinterleave(samples, channels);
 
+
+
 float[] ProcessChannel(float[] input, int fftSize, int hopSize)
 {
     var window = Window.Hann(fftSize);
-    float[] output = new float[input.Length + fftSize];
+    int outputLength = input.Length;
+    float[] output = new float[outputLength];
 
-    for (int pos = 0; pos + fftSize < input.Length; pos += hopSize)
-    {
-        // Windowed frame
-        Complex32[] frame = new Complex32[fftSize];
-        for (int i = 0; i < fftSize; i++)
-            frame[i] = new Complex32(input[pos + i] * (float)window[i], 0f);
+    if (input.Length <= fftSize)
+        throw new ArgumentException("Input length must be greater than FFT size.");
 
-        // FFT
-        Fourier.Forward(frame, FourierOptions.Matlab);
+    int frames = 1 + ((input.Length - fftSize - 1) / hopSize);
 
-        // Select just a few of the loudest frequencies & discard phase
-        var tops = frame.Select((Sample, I) => new { Sample, I }).OrderByDescending(x => x.Sample.Magnitude).Take(frequencyLimit).ToList();
-        frame = new Complex32[fftSize];
-        foreach (var item in tops)
+    object mergeLock = new();
+
+    Parallel.For(0, frames,
+        frameIndex =>
         {
-            frame[item.I] = new Complex32(item.Sample.Magnitude, 0f);
-        }
+            var pos = frameIndex * hopSize;
 
-        // Inverse FFT
-        Fourier.Inverse(frame, FourierOptions.Matlab);
+            // Windowed frame
+            Complex32[] frame = new Complex32[fftSize];
+            for (int i = 0; i < fftSize; i++)
+                frame[i] = new Complex32(input[pos + i] * (float)window[i], 0f);
 
-        // Overlap-add
-        for (int i = 0; i < fftSize; i++)
-            output[pos + i] += frame[i].Real * (float)window[i];
-    }
+            // FFT
+            Fourier.Forward(frame, FourierOptions.Matlab);
+
+            // Select just a few of the loudest frequencies & discard phase
+            var tops = frame.Select((Sample, I) => new { Sample, I }).OrderByDescending(x => x.Sample.Magnitude).Take(frequencyLimit).ToList();
+            var sparse = new Complex32[fftSize];
+            foreach (var item in tops)
+            {
+                sparse[item.I] = new Complex32(item.Sample.Magnitude, 0f);
+            }
+
+            // Inverse FFT
+            Fourier.Inverse(sparse, FourierOptions.Matlab);
+
+            // Overlap-add to merge into into final output
+            lock (mergeLock)
+            {
+                for (int i = 0; i < fftSize; i++)
+                    output[pos + i] += sparse[i].Real * (float)window[i];
+            }
+        });
 
     return output;
 }
