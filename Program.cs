@@ -70,13 +70,26 @@ float[] ProcessChannel(float[] input, int fftSize, int hopSize)
         // FFT
         Fourier.Forward(frame, FourierOptions.Matlab);
 
+        var flattenedHarmonics = new float[fftSize];
+        for (int i = 0; i < fftSize; i++)
+        {
+            var x = frame[i].Magnitude;
+            // bias towards notes with harmonics
+            for (int j = 2; j < 16 & i * j < fftSize; j++)
+                x *= frame[i * j].Magnitude + 1;
+
+            // bias against tones that are harmonics of an alreay identified note
+            for (int j = 2; j < 16 && i % j == 0 && i / j > 0; j++)
+                x -= flattenedHarmonics[i / j] / 2;
+
+            flattenedHarmonics[i] = x;
+        }
+
         // Select just a few of the loudest frequencies & discard phase
-        var tops = frame.Select((Sample, I) => new { Sample, I }).OrderByDescending(x => x.Sample.Magnitude).Take(frequencyLimit).ToList();
+        var tops = flattenedHarmonics.Select((Sample, I) => new { Sample, I }).OrderByDescending(x => x.Sample).Take(frequencyLimit).ToList();
         var sparse = new Complex32[fftSize];
         foreach (var item in tops)
-        {
-            sparse[item.I] = new Complex32(item.Sample.Magnitude, 0f);
-        }
+            sparse[item.I] = frame[item.I];
 
         // Inverse FFT
         Fourier.Inverse(sparse, FourierOptions.Matlab);
@@ -128,7 +141,7 @@ void WriteMp3(string path, float[] samples, int sampleRate, int channels)
     writer.Flush();
     ms.Position = 0;
     using var reader = new WaveFileReader(ms);
-    var mp3Writer = new LameMP3FileWriter(path, reader.WaveFormat, LAMEPreset.STANDARD);
+    var mp3Writer = new LameMP3FileWriter(path, reader.WaveFormat, LAMEPreset.V9);
     reader.CopyTo(mp3Writer);
 }
 
